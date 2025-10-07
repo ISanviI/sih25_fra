@@ -1,0 +1,20 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+geoalchemy2
+earthengine-api
+segmentation-models-pytorch
+torch
+torchvision
+torchaudio
+rasterio
+numpy
+matplotlib
+pandas
+python-dotenv
+alembic
+mercantile
+Pillow
+Shapely
