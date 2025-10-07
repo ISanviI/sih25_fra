@@ -110,45 +110,110 @@ async def get_tile(region_id: str, z: int, x: int, y: int):
 
     try:
         with rasterio.open(stitched_image_path) as src:
-            # Get the tile bounds directly in WGS84 (EPSG:4326), which matches the source raster
-            wgs_bbox = mercantile.bounds(x, y, z)
+            # Get tile bounds in WGS84
+            wgs_bounds = mercantile.bounds(x, y, z)
             
-            # Create a window from the WGS84 bounds
-            window = src.window(wgs_bbox.west, wgs_bbox.south, wgs_bbox.east, wgs_bbox.north)
+            # Get the bounds of the source raster
+            src_bounds = src.bounds
             
-            # Read the data in the window, ensuring output is 256x256
-            data = src.read(window=window, boundless=True, out_shape=(256, 256))
-
-            # Convert data to a colored paletted image
-            img_data = data[0] # Assuming single band
-            img = Image.fromarray(img_data.astype('uint8'), 'P') # 'P' for paletted
-
-            # Define a color palette for the 6 classes
-            # [Background, Forest, Agriculture, Water, Built-up, Degraded Forest]
-            palette = [
-                0, 0, 0,        # 0: Black (Transparent - will be set below)
-                34, 139, 34,    # 1: ForestGreen
-                154, 205, 50,   # 2: YellowGreen
-                30, 144, 255,   # 3: DodgerBlue
-                128, 128, 128,  # 4: Gray
-                210, 180, 140,  # 5: Tan
-            ]
-            # Fill the rest of the 256-color palette
-            palette.extend([0] * (256 * 3 - len(palette)))
-            img.putpalette(palette)
-
-            # Save image to a byte stream with transparency for the background
+            print(f"Tile {z}/{x}/{y} bounds in WGS84: {wgs_bounds}")
+            print(f"Source raster bounds: {src_bounds}")
+            print(f"Source raster CRS: {src.crs}")
+            print(f"Source raster shape: {src.shape}")
+            
+            # Transform tile bounds from WGS84 to the source CRS
+            if src.crs.to_string() != 'EPSG:4326':
+                from rasterio.warp import transform_bounds
+                tile_bounds_in_src_crs = transform_bounds(
+                    'EPSG:4326', 
+                    src.crs,
+                    wgs_bounds.west, 
+                    wgs_bounds.south, 
+                    wgs_bounds.east, 
+                    wgs_bounds.north
+                )
+                print(f"Tile bounds in source CRS: {tile_bounds_in_src_crs}")
+            else:
+                tile_bounds_in_src_crs = (
+                    wgs_bounds.west, 
+                    wgs_bounds.south, 
+                    wgs_bounds.east, 
+                    wgs_bounds.north
+                )
+            
+            # Check if tile bounds intersect with source bounds
+            if (tile_bounds_in_src_crs[2] < src_bounds.left or 
+                tile_bounds_in_src_crs[0] > src_bounds.right or 
+                tile_bounds_in_src_crs[3] < src_bounds.bottom or 
+                tile_bounds_in_src_crs[1] > src_bounds.top):
+                print(f"Tile {z}/{x}/{y} does not intersect with source raster")
+                # Return empty transparent tile
+                img = Image.new('RGBA', (256, 256), (0, 0, 0, 0))
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='PNG')
+                img_byte_arr.seek(0)
+                return StreamingResponse(img_byte_arr, media_type="image/png")
+            
+            # Create window from bounds
+            window = rasterio.windows.from_bounds(
+                tile_bounds_in_src_crs[0],  # left
+                tile_bounds_in_src_crs[1],  # bottom
+                tile_bounds_in_src_crs[2],  # right
+                tile_bounds_in_src_crs[3],  # top
+                src.transform
+            )
+            
+            print(f"Window: {window}")
+            
+            # Read the data
+            data = src.read(
+                1,
+                window=window,
+                out_shape=(256, 256),
+                boundless=True,
+                fill_value=0
+            )
+            
+            print(f"Data shape: {data.shape}, dtype: {data.dtype}")
+            print(f"Data range: min={data.min()}, max={data.max()}")
+            print(f"Unique values: {np.unique(data)}")
+            
+            # Create colored image
+            img_array = np.zeros((256, 256, 4), dtype=np.uint8)
+            
+            # Define colors for each class (RGBA)
+            colors = {
+                0: [0, 0, 0, 0],          # Background - Transparent
+                1: [34, 139, 34, 255],     # Forest - ForestGreen
+                2: [154, 205, 50, 255],    # Agriculture - YellowGreen
+                3: [30, 144, 255, 255],    # Water - DodgerBlue
+                4: [128, 128, 128, 255],   # Built-up - Gray
+                5: [210, 180, 140, 255],   # Degraded Forest - Tan
+            }
+            
+            # Apply colors
+            for class_id, color in colors.items():
+                mask = data == class_id
+                img_array[mask] = color
+            
+            # Convert to PIL Image
+            img = Image.fromarray(img_array, 'RGBA')
+            
+            # Save to bytes
             img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG', transparency=0)
+            img.save(img_byte_arr, format='PNG')
             img_byte_arr.seek(0)
-
+            
+            print(f"Tile {z}/{x}/{y} generated successfully")
+            
             return StreamingResponse(img_byte_arr, media_type="image/png")
 
     except Exception as e:
-        # Log the error for debugging
         print(f"Error generating tile for {region_id} at {z}/{x}/{y}: {e}")
-        return HTTPException(status_code=500, detail=f"Error generating tile: {e}")
-
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error generating tile: {e}")
+    
 @app.get("/regions/")
 def read_regions(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     regions = crud.get_regions(db, skip=skip, limit=limit)
@@ -213,3 +278,27 @@ def get_region_at_point(lat: float, lon: float, db: Session = Depends(get_db)):
 @app.get("/images/{image_name}")
 async def get_image(image_name: str):
     return FileResponse(f"./{image_name}")
+
+@app.get("/debug/segmentation-info")
+def debug_segmentation():
+    if "last_click" not in processed_regions:
+        return {"error": "No processed region"}
+    
+    path = processed_regions["last_click"]
+    if not os.path.exists(path):
+        return {"error": "File not found"}
+    
+    with rasterio.open(path) as src:
+        data = src.read(1)
+        unique, counts = np.unique(data, return_counts=True)
+        
+        return {
+            "path": path,
+            "shape": data.shape,
+            "crs": str(src.crs),
+            "bounds": src.bounds,
+            "transform": list(src.transform),
+            "unique_values": dict(zip(unique.tolist(), counts.tolist())),
+            "min": int(data.min()),
+            "max": int(data.max())
+        }

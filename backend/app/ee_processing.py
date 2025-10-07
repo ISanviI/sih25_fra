@@ -9,6 +9,7 @@ import segmentation_models_pytorch as smp
 import matplotlib.pyplot as plt
 import requests
 from dotenv import load_dotenv
+from PIL import Image
 
 def calculate_stats(seg_map):
     class_names = ['Background', 'Forest', 'Agriculture', 'Water', 'Built-up', 'Degraded Forest']
@@ -135,36 +136,83 @@ def process_geometry(lat: float, lon: float):
         seg_map[agri_mask] = 2
         seg_map[degraded_mask] = 5
 
+        # Save as raw PNG with PIL instead of matplotlib
         seg_filename = tile_file.replace('.tif', '_seg.png')
         seg_path = os.path.join(seg_dir, seg_filename)
-        plt.imsave(seg_path, seg_map, cmap='tab10')
+        
+        # Convert to PIL Image and save (this preserves exact pixel values)
+        seg_img = Image.fromarray(seg_map.astype(np.uint8), mode='L')  # 'L' for grayscale
+        seg_img.save(seg_path, compress_level=1)
+        
+        print(f"Saved {seg_filename} with classes: {np.unique(seg_map)}")
 
     stitched_path = 'stitched_segmentation_4band.tif'
     tile_files = sorted([f for f in os.listdir(seg_dir) if f.endswith('_seg.png')])
+
+    if not tile_files:
+        raise Exception("No segmentation tiles found!")
+
     indices = [tuple(map(int, f.split('_')[1:3])) for f in tile_files]
     max_i, max_j = max(idx[0] for idx in indices), max(idx[1] for idx in indices)
 
-    with rasterio.open(os.path.join(output_dir, f'tile_0_0.tif')) as src:
+    # Get the first tile to extract metadata and geotransform
+    first_tile_path = os.path.join(output_dir, 'tile_0_0.tif')
+    with rasterio.open(first_tile_path) as src:
         tile_h, tile_w = src.height, src.width
-        meta = src.meta.copy()
-        meta.update(count=1, dtype='uint8')
+        base_transform = src.transform
+        crs = src.crs
+        bounds = src.bounds
+        
+        print(f"Base transform: {base_transform}")
+        print(f"CRS: {crs}")
+        print(f"Tile size: {tile_h}x{tile_w}")
+        print(f"First tile bounds: {bounds}")
 
+    # Calculate full dimensions
     full_h = (max_i + 1) * tile_h
     full_w = (max_j + 1) * tile_w
     full_seg = np.zeros((full_h, full_w), dtype=np.uint8)
 
+    print(f"Stitching {len(tile_files)} tiles into {full_h}x{full_w} image")
+
+    # Stitch all tiles together
     for tile_file in tile_files:
         parts = tile_file.replace('_seg.png','').split('_')
         ti, tj = int(parts[1]), int(parts[2])
         tile_path = os.path.join(seg_dir, tile_file)
-        seg_tile = plt.imread(tile_path)[:, :, 0]
+        
+        # Read the segmentation tile as grayscale using PIL to preserve exact values
+        seg_tile_img = Image.open(tile_path)
+        seg_tile = np.array(seg_tile_img).astype(np.uint8)
+        
         th, tw = seg_tile.shape
         full_seg[ti*tile_h:ti*tile_h+th, tj*tile_w:tj*tile_w+tw] = seg_tile
+        
+        print(f"Stitched tile {ti},{tj} - unique values: {np.unique(seg_tile)}")
+
+    # Check the full segmentation
+    unique_vals, counts = np.unique(full_seg, return_counts=True)
+    print(f"Full segmentation unique values: {dict(zip(unique_vals, counts))}")
+
+    # Write the stitched file with proper georeferencing
+    meta = {
+        'driver': 'GTiff',
+        'height': full_h,
+        'width': full_w,
+        'count': 1,
+        'dtype': 'uint8',
+        'crs': crs,
+        'transform': base_transform,
+        'compress': 'lzw'
+    }
 
     with rasterio.open(stitched_path, 'w', **meta) as dst:
         dst.write(full_seg, 1)
 
+    print(f"Stitched segmentation saved to {stitched_path}")
+
+    # Recalculate stats from the actual stitched image
     stats = calculate_stats(full_seg)
+    print(f"Final statistics: {stats}")
 
     return {"message": "Processing complete", "stitched_image_path": stitched_path, "stats": stats}
-
