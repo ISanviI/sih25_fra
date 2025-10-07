@@ -43,7 +43,8 @@ def preprocess_tile_4channel(tile_path):
         img = np.nan_to_num(img, nan=0.0)
     return img
 
-def process_geometry(geometry: dict):
+def process_geometry(lat: float, lon: float):
+    """Processes a circular region around a given lat/lon point."""
     try:
         ee_service_account_email = os.getenv("EE_SERVICE_ACCOUNT_EMAIL")
         ee_key_file = os.getenv("EE_KEY_FILE")
@@ -51,23 +52,22 @@ def process_geometry(geometry: dict):
     except Exception as e:
         raise Exception(f"Error initializing Earth Engine: {e}")
 
-    ee_geometry = ee.Geometry.Rectangle(geometry['coordinates'])
+    # Create a point from the lat/lon, then buffer it to create a circular region.
+    click_point = ee.Geometry.Point([lon, lat])
+    ee_geometry = click_point.buffer(5000)  # Buffer by 5000 meters (5km radius)
 
-    image_collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
-        .filterBounds(ee_geometry) \
-        .filterDate('2024-01-01', '2025-09-22') \
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)) \
-        .sort('system:time_start', False)
+    image_collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')         .filterBounds(ee_geometry)         .filterDate('2024-01-01', '2025-09-22')         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))         .sort('system:time_start', False)
     image = image_collection.first().select(['B2', 'B3', 'B4', 'B8'])
 
     url = image.getDownloadURL({
-        'scale': 10,
+        'scale': 10,  # Back to high resolution
         'crs': 'EPSG:4326',
-        'region': ee_geometry.getInfo()['coordinates']
+        'region': ee_geometry.getInfo()['coordinates'],
+        'format': 'GEO_TIFF'  # Explicitly request a GeoTIFF instead of a ZIP
     })
 
     response = requests.get(url)
-    tif_path = 'sentinel2_odisha_tile_4band.tif'
+    tif_path = 'sentinel2_tile_4band.tif'
     with open(tif_path, 'wb') as f:
         f.write(response.content)
 

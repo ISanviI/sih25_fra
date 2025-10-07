@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from . import models
 from database import schemas
-from geoalchemy2.functions import ST_Contains, ST_MakePoint
+from geoalchemy2.functions import ST_Contains, ST_MakePoint, ST_SetSRID
 
 def get_region(db: Session, region_id: int):
     return db.query(models.Region).filter(models.Region.id == region_id).first()
@@ -30,4 +30,5 @@ def create_user(db: Session, user: schemas.UserCreate):
     return db_user
 
 def get_region_at_point(db: Session, lat: float, lon: float):
-    return db.query(models.Region).filter(ST_Contains(models.Region.geom, ST_MakePoint(lon, lat))).first()
+    point = ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+    return db.query(models.Region).filter(ST_Contains(models.Region.geom, point)).first()

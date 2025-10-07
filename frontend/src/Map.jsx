@@ -68,7 +68,7 @@ function MapComponent() {
 
       {overlayUrl && (
         <LayersControl.Overlay checked name="Segmented Layer">
-            <TileLayer url={overlayUrl} />
+            <TileLayer url={overlayUrl} key={overlayUrl} />
         </LayersControl.Overlay>
       )}
 

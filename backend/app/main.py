@@ -81,23 +81,26 @@ def get_ee_tile_url():
         raise HTTPException(status_code=500, detail=f"Error generating EE tile URL: {e}")
 
 @app.post("/process-region")
-def process_region(lat: float, lon: float, db: Session = Depends(get_db)):
-    db_region = crud.get_region_at_point(db, lat=lat, lon=lon)
-    if db_region is None:
-        raise HTTPException(status_code=404, detail="Region not found at this location.")
-
-    region_shape = to_shape(db_region.geom)
-    region_geometry = region_shape.__geo_interface__
-
+def process_region(lat: float, lon: float):
+    """Processes a circular region around the given lat/lon."""
     try:
-        result = ee_processing.process_geometry(region_geometry)
-        processed_regions[db_region.id] = result["stitched_image_path"]
-        return {"region_id": db_region.id, "stats": result["stats"]}
+        # Pass lat/lon directly to the processing function
+        result = ee_processing.process_geometry(lat=lat, lon=lon)
+        
+        # Use a static key for the processed image path, since we don't have a region ID
+        processed_regions["last_click"] = result["stitched_image_path"]
+        
+        # The frontend expects a "region_id" to build the tile URL. We'll return our static key.
+        return {"region_id": "last_click", "stats": result["stats"]}
     except Exception as e:
+        import traceback
+        print("--- DETAILED ERROR IN /process-region ---")
+        traceback.print_exc()
+        print("-----------------------------------------")
         raise HTTPException(status_code=500, detail=f"Error processing region: {e}")
 
 @app.get("/tiles/{region_id}/{z}/{x}/{y}")
-async def get_tile(region_id: int, z: int, x: int, y: int):
+async def get_tile(region_id: str, z: int, x: int, y: int):
     if region_id not in processed_regions:
         raise HTTPException(status_code=404, detail="Processed region not found.")
 
@@ -107,37 +110,43 @@ async def get_tile(region_id: int, z: int, x: int, y: int):
 
     try:
         with rasterio.open(stitched_image_path) as src:
-            # Get the bounding box of the tile in Web Mercator (EPSG:3857)
-            mercator_bbox = mercantile.xy_bounds(x, y, z)
+            # Get the tile bounds directly in WGS84 (EPSG:4326), which matches the source raster
+            wgs_bbox = mercantile.bounds(x, y, z)
             
-            # Convert Web Mercator bbox to the CRS of the raster
-            dst_crs = src.crs
-            west, south, east, north = rasterio.warp.transform_bounds(
-                'EPSG:3857', 
-                dst_crs, 
-                mercator_bbox.left, 
-                mercator_bbox.bottom, 
-                mercator_bbox.right, 
-                mercator_bbox.top
-            )
-
-            # Read the data in the window
-            window = src.window(west, south, east, north)
+            # Create a window from the WGS84 bounds
+            window = src.window(wgs_bbox.west, wgs_bbox.south, wgs_bbox.east, wgs_bbox.north)
+            
+            # Read the data in the window, ensuring output is 256x256
             data = src.read(window=window, boundless=True, out_shape=(256, 256))
 
-            # Convert data to an image
-            # Assuming single band image, colormap will be applied by frontend or here
+            # Convert data to a colored paletted image
             img_data = data[0] # Assuming single band
-            img = Image.fromarray(img_data.astype('uint8'))
-            
-            # Save image to a byte stream
+            img = Image.fromarray(img_data.astype('uint8'), 'P') # 'P' for paletted
+
+            # Define a color palette for the 6 classes
+            # [Background, Forest, Agriculture, Water, Built-up, Degraded Forest]
+            palette = [
+                0, 0, 0,        # 0: Black (Transparent - will be set below)
+                34, 139, 34,    # 1: ForestGreen
+                154, 205, 50,   # 2: YellowGreen
+                30, 144, 255,   # 3: DodgerBlue
+                128, 128, 128,  # 4: Gray
+                210, 180, 140,  # 5: Tan
+            ]
+            # Fill the rest of the 256-color palette
+            palette.extend([0] * (256 * 3 - len(palette)))
+            img.putpalette(palette)
+
+            # Save image to a byte stream with transparency for the background
             img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
+            img.save(img_byte_arr, format='PNG', transparency=0)
             img_byte_arr.seek(0)
 
             return StreamingResponse(img_byte_arr, media_type="image/png")
 
     except Exception as e:
+        # Log the error for debugging
+        print(f"Error generating tile for {region_id} at {z}/{x}/{y}: {e}")
         return HTTPException(status_code=500, detail=f"Error generating tile: {e}")
 
 @app.get("/regions/")
